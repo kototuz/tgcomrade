@@ -34,6 +34,7 @@ static void process_update(td_api::object_ptr<td_api::Object> u);
 static bool str_to_int64(const char *str, size_t len, std::int64_t *res);
 static bool load_model(const char *model);
 static bool generate_response(const std::string &prompt, std::string &res);
+static bool parse_args(int argc, char **argv, std::int64_t *chat_id, char **model_path, char **sys_prompt);
 
 static td::ClientManager manager;
 static std::int32_t      client_id;
@@ -50,19 +51,15 @@ static int prev_formatted_len = 0;
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <chat-id> <model.gguf>\n", argv[0]);
-        return 1;
+    char *model_path;
+    char *sys_prompt;
+    if (!parse_args(argc, argv, &chat_id, &model_path, &sys_prompt)) return 1;
+
+    if (!load_model(model_path)) return 1;
+
+    if (sys_prompt != nullptr) {
+        messages.push_back({"system", strdup(sys_prompt)});
     }
-
-    if (!str_to_int64(argv[1], strlen(argv[1]), &chat_id)) {
-        fputs("ERROR: Invalid chat id integer\n", stderr);
-        return 1;
-    }
-
-    if (!load_model(argv[2])) return 1;
-
-    messages.push_back({"system", "Answer in a conversational style"});
 
     // Initialize client
     td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
@@ -204,6 +201,55 @@ static bool load_model(const char *model_path)
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     formatted = std::vector<char>(llama_n_ctx(ctx));
+
+    return true;
+}
+
+static bool parse_args(int argc, char **argv,
+                       std::int64_t *chat_id,
+                       char **model_path,
+                       char **sys_prompt)
+{
+#define CHAT_ID_FLAG 0b01
+#define MODEL_FLAG   0b10
+
+    *sys_prompt = nullptr;
+
+    char state = 0;
+    for (int i = 1; i < argc; i += 2) {
+        if (strcmp(argv[i], "-c") == 0) {
+            if (i+1 >= argc) {
+                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
+                return false;
+            }
+            if (!str_to_int64(argv[i+1], strlen(argv[i+1]), chat_id)) {
+                fputs("ERROR: Invalid chat id integer\n", stderr);
+                return false;
+            }
+            state |= CHAT_ID_FLAG;
+        } else if (strcmp(argv[i], "-m") == 0) {
+            if (i+1 >= argc) {
+                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
+                return false;
+            }
+            *model_path = argv[i+1];
+            state |= MODEL_FLAG;
+        } else if (strcmp(argv[i], "-sys") == 0) {
+            if (i+1 >= argc) {
+                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
+                return false;
+            }
+            *sys_prompt = argv[i+1];
+        } else {
+            fprintf(stderr, "ERROR: Unknown flag '%s'\n", argv[i]);
+            return false;
+        }
+    }
+
+    if (state != (CHAT_ID_FLAG|MODEL_FLAG)) {
+        fprintf(stderr, "Usage: %s -c <chat-id> -m <model.gguf> [-sys <sys-prompt>]\n", argv[0]);
+        return false;
+    }
 
     return true;
 }
