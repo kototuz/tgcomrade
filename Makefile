@@ -22,6 +22,8 @@ TD_LIBS=-ltdclient       \
         -ltdactor
 OTHER_LIBS=-lm -lz -lssl -lcrypto
 
-tgcomrade: main.cpp
-	$(CXX) $(CXXFLAGS) -DTG_API_ID=$(TG_API_ID) -DTG_API_HASH="\"$(TG_API_HASH)\"" -o tgcomrade main.cpp -Iinclude -fPIC -L$(LIBS_PATH) $(TD_LIBS) $(OTHER_LIBS) -Wl,-rpath,$(LIBS_PATH) $(LLAMA_LIBS)
+tgcomrade: build src/tgcomrade.cpp
+	$(CXX) $(CXXFLAGS) -DTG_API_ID=$(TG_API_ID) -DTG_API_HASH="\"$(TG_API_HASH)\"" -o build/tgcomrade src/tgcomrade.cpp -Iinclude -fPIC -L$(LIBS_PATH) $(TD_LIBS) $(OTHER_LIBS) -Wl,-rpath,$(LIBS_PATH) $(LLAMA_LIBS)
 
+build:
+	mkdir -p build
