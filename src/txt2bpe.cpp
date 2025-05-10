@@ -18,22 +18,17 @@ struct Token {
 
 struct Pair {
     Token l, r;
-    uint64_t freq;
-};
 
-struct Pair_Key {
-    Token l, r;
-
-    bool operator==(const Pair_Key &other) const {
+    bool operator==(const Pair &other) const {
         return l.value == other.l.value &&
                r.value == other.r.value;
     }
 };
 
 template <>
-struct std::hash<Pair_Key>
+struct std::hash<Pair>
 {
-    std::size_t operator()(const Pair_Key& k) const
+    std::size_t operator()(const Pair& k) const
     {
         union {
             uint32_t lr[2];
@@ -47,12 +42,18 @@ struct std::hash<Pair_Key>
     }
 };
 
+typedef std::unordered_map<Pair, size_t> Freq;
 
 bool parse_tokens_from_file(const char *path, std::vector<Token> &result)
 {
     std::ifstream ifs(path);
     std::string bytes((std::istreambuf_iterator<char>(ifs)),
                         (std::istreambuf_iterator<char>()));
+
+    if (!ifs.good()) {
+        fprintf(stderr, "ERROR: Could not open file '%s'\n", path);
+        return false;
+    }
 
     size_t mbslen = mbstowcs(NULL, bytes.c_str(), 0);
     if (mbslen == (size_t)-1) {
@@ -74,11 +75,11 @@ bool parse_tokens_from_file(const char *path, std::vector<Token> &result)
     return true;
 }
 
-std::unordered_map<Pair_Key, size_t> collect_freqs(std::vector<Token> &tokens_in)
+Freq collect_freqs(std::vector<Token> &tokens_in)
 {
-    std::unordered_map<Pair_Key, size_t> result;
+    Freq result;
     for (size_t i = 0; i < tokens_in.size() - 1; i++) {
-        Pair_Key pair = {tokens_in[i], tokens_in[i + 1]};
+        Pair pair = {tokens_in[i], tokens_in[i + 1]};
         if (result.count(pair)) result[pair] += 1;
         else result.insert({pair, 1});
     }
@@ -103,7 +104,7 @@ void print_tokens(std::vector<Token> *tokens)
     printf("\n");
 }
 
-void print_freq(std::unordered_map<Pair_Key, size_t> &freq)
+void print_freq(Freq &freq)
 {
     for (auto const &it : freq) {
         printf("(");
@@ -114,7 +115,7 @@ void print_freq(std::unordered_map<Pair_Key, size_t> &freq)
     }
 }
 
-void pair_dec_freq_or_remove(Pair_Key k, std::unordered_map<Pair_Key, size_t> &freq)
+void pair_dec_freq_or_remove(Pair k, Freq &freq)
 {
     auto pair_freq = freq.find(k);
     assert(pair_freq != freq.end());
@@ -148,6 +149,27 @@ bool write_entire_file(const char *path, const void *data, size_t size)
     return true;
 }
 
+bool find_most_frequent_pair(std::vector<Token> *tokens, Pair &res)
+{
+    Freq freq = Freq(tokens->size() - 1);
+    for (size_t i = 0; i < tokens->size() - 1; i++) {
+        Pair k = {tokens->at(i), tokens->at(i+1)};
+        Freq::iterator entry = freq.find(k);
+        if (entry == freq.end()) freq.insert({k, 1});
+        else entry->second += 1;
+    }
+
+    size_t max_freq = 0;
+    for (const auto &it : freq) {
+        if (it.second > max_freq) {
+            max_freq = it.second;
+            res = {it.first.l, it.first.r};
+        }
+    }
+
+    return max_freq > 1;
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -158,89 +180,30 @@ int main(int argc, char **argv)
     setlocale(LC_ALL, "");
 
     std::vector<Token> tokens_in_buf;
-    parse_tokens_from_file(argv[1], tokens_in_buf);
+    if (!parse_tokens_from_file(argv[1], tokens_in_buf)) return 1;
     std::vector<Token> *tokens_in = &tokens_in_buf;
 
     std::vector<Token> tokens_out_buf;
     std::vector<Token> *tokens_out = &tokens_out_buf;
 
-    std::unordered_map<Pair_Key, size_t> freq = collect_freqs(tokens_in_buf);
-
+    Pair most_freq_pair;
     std::vector<Pair> pairs;
-    while (true) {
-        // print_tokens(tokens_in);
-        // print_tokens(tokens_out);
-        // print_freq(freq);
-        // puts("==============================");
-        // printf("INFO: Token count: %zu\n", tokens_in->size());
-        // printf("INFO: Pair count:  %zu\n", pairs.size());
-
-        Pair_Key max_pair;
-        size_t max_freq = 0;
-        for (const auto &it : freq) {
-            if (it.second > max_freq) {
-                max_freq = it.second;
-                max_pair = it.first;
-            }
-        }
-
-        // print_token(max_pair.l); puts("");
-        // print_token(max_pair.r); puts("");
-
-        if (max_freq <= 1) break; // compression is done
+    while (find_most_frequent_pair(tokens_in, most_freq_pair)) {
+        printf("INFO: tokens=%zu, pairs=%zu\n",
+               tokens_in->size(), pairs.size());
 
         uint32_t new_token_id = pairs.size();
-        pairs.push_back({max_pair.l, max_pair.r, max_freq});
+        pairs.push_back(most_freq_pair);
 
         tokens_out->clear();
-        for (size_t i = 0; i < tokens_in->size();) {
-            if (i + 1 >= tokens_in->size()) {
+        for (size_t i = 0; i < tokens_in->size() - 1;) {
+            Pair p = {tokens_in->at(i), tokens_in->at(i+1)};
+            if (memcmp(&p, &most_freq_pair, sizeof(p)) == 0) {
+                tokens_out->push_back({new_token_id, true});
+                i += 2;
+            } else {
                 tokens_out->push_back(tokens_in->at(i));
                 i += 1;
-            } else {
-                Pair_Key pair;
-                pair.l = tokens_in->at(i);
-                pair.r = tokens_in->at(i + 1);
-                if (memcmp(&pair, &max_pair, sizeof(pair)) == 0) {
-                    print_token(pair.l); puts("");
-                    print_token(pair.r); puts("");
-                    puts("OK!");
-                    std::unordered_map<Pair_Key, size_t>::iterator pair_freq;
-                    if (tokens_out->size() > 0) {
-                        pair.l = tokens_out->at(tokens_out->size() - 1);
-
-                        pair.r = tokens_in->at(i);
-                        pair_dec_freq_or_remove(pair, freq);
-
-                        pair.r = {new_token_id, true};
-                        if (!freq.count(pair)) freq.insert({pair, 1});
-                        else freq[pair] += 1;
-                    }
-
-                    pair = max_pair;
-                    pair_dec_freq_or_remove(pair, freq);
-
-                    tokens_out->push_back({new_token_id, true});
-                    i += 2;
-
-                    //         v
-                    // in:  abcd
-                    // out: aZ
-                    // Z=bc
-                    if (i < tokens_in->size()) {
-                        pair.r = tokens_in->at(i);
-
-                        pair.l = tokens_in->at(i-1);
-                        pair_dec_freq_or_remove(pair, freq);
-
-                        pair.l = tokens_out->at(tokens_out->size()-1);
-                        if (!freq.count(pair)) freq.insert({pair, 1});
-                        else freq[pair] += 1;
-                    }
-                } else {
-                    tokens_out->push_back(tokens_in->at(i));
-                    i += 1;
-                }
             }
         }
 
@@ -249,17 +212,103 @@ int main(int argc, char **argv)
         tokens_out = tmp;
     }
 
-    // print_freq(freq);
-    //
-    // for (size_t i = 0; i < tokens_in->size(); i++) {
-    //     Token token = tokens_in->at(i);
-    //     print_token(token);
-    // }
-
-    printf("INFO: Generated %zu pairs\n", pairs.size());
-
     if (!write_entire_file(OUTPUT_FILE, pairs.data(), pairs.size()*sizeof(Pair)))
         return 1;
+
+    // std::vector<Pair> pairs;
+    // while (true) {
+    //     // print_tokens(tokens_in);
+    //     // print_tokens(tokens_out);
+    //     // print_freq(freq);
+    //     // puts("==============================");
+    //     // printf("INFO: Token count: %zu\n", tokens_in->size());
+    //     // printf("INFO: Pair count:  %zu\n", pairs.size());
+    //
+    //     Pair_Key max_pair;
+    //     size_t max_freq = 0;
+    //     for (const auto &it : freq) {
+    //         if (it.second > max_freq) {
+    //             max_freq = it.second;
+    //             max_pair = it.first;
+    //         }
+    //     }
+    //
+    //     // print_token(max_pair.l); puts("");
+    //     // print_token(max_pair.r); puts("");
+    //
+    //     if (max_freq <= 1) break; // compression is done
+    //
+    //     uint32_t new_token_id = pairs.size();
+    //     pairs.push_back({max_pair.l, max_pair.r, max_freq});
+    //
+    //     tokens_out->clear();
+    //     for (size_t i = 0; i < tokens_in->size();) {
+    //         if (i + 1 >= tokens_in->size()) {
+    //             tokens_out->push_back(tokens_in->at(i));
+    //             i += 1;
+    //         } else {
+    //             Pair_Key pair;
+    //             pair.l = tokens_in->at(i);
+    //             pair.r = tokens_in->at(i + 1);
+    //             if (memcmp(&pair, &max_pair, sizeof(pair)) == 0) {
+    //                 print_token(pair.l); puts("");
+    //                 print_token(pair.r); puts("");
+    //                 puts("OK!");
+    //                 Freq::iterator pair_freq;
+    //                 if (tokens_out->size() > 0) {
+    //                     pair.l = tokens_out->at(tokens_out->size() - 1);
+    //
+    //                     pair.r = tokens_in->at(i);
+    //                     pair_dec_freq_or_remove(pair, freq);
+    //
+    //                     pair.r = {new_token_id, true};
+    //                     if (!freq.count(pair)) freq.insert({pair, 1});
+    //                     else freq[pair] += 1;
+    //                 }
+    //
+    //                 pair = max_pair;
+    //                 pair_dec_freq_or_remove(pair, freq);
+    //
+    //                 tokens_out->push_back({new_token_id, true});
+    //                 i += 2;
+    //
+    //                 //         v
+    //                 // in:  abcd
+    //                 // out: aZ
+    //                 // Z=bc
+    //                 if (i < tokens_in->size()) {
+    //                     pair.r = tokens_in->at(i);
+    //
+    //                     pair.l = tokens_in->at(i-1);
+    //                     pair_dec_freq_or_remove(pair, freq);
+    //
+    //                     pair.l = tokens_out->at(tokens_out->size()-1);
+    //                     if (!freq.count(pair)) freq.insert({pair, 1});
+    //                     else freq[pair] += 1;
+    //                 }
+    //             } else {
+    //                 tokens_out->push_back(tokens_in->at(i));
+    //                 i += 1;
+    //             }
+    //         }
+    //     }
+    //
+    //     auto *tmp = tokens_in;
+    //     tokens_in = tokens_out;
+    //     tokens_out = tmp;
+    // }
+    //
+    // // print_freq(freq);
+    // //
+    // // for (size_t i = 0; i < tokens_in->size(); i++) {
+    // //     Token token = tokens_in->at(i);
+    // //     print_token(token);
+    // // }
+    //
+    // printf("INFO: Generated %zu pairs\n", pairs.size());
+    //
+    // if (!write_entire_file(OUTPUT_FILE, pairs.data(), pairs.size()*sizeof(Pair)))
+    //     return 1;
 
     return 0;
 }
