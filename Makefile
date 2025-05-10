@@ -22,8 +22,13 @@ TD_LIBS=-ltdclient       \
         -ltdactor
 OTHER_LIBS=-lm -lz -lssl -lcrypto
 
+all: tgcomrade txt2bpe
+
 tgcomrade: build src/tgcomrade.cpp
 	$(CXX) $(CXXFLAGS) -DTG_API_ID=$(TG_API_ID) -DTG_API_HASH="\"$(TG_API_HASH)\"" -o build/tgcomrade src/tgcomrade.cpp -Iinclude -fPIC -L$(LIBS_PATH) $(TD_LIBS) $(OTHER_LIBS) -Wl,-rpath,$(LIBS_PATH) $(LLAMA_LIBS)
+
+txt2bpe: build src/txt2bpe.cpp
+	$(CXX) $(CXXFLAGS) -o build/txt2bpe src/txt2bpe.cpp
 
 build:
 	mkdir -p build
