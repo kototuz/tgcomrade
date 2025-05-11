@@ -18,17 +18,22 @@ struct Token {
 
 struct Pair {
     Token l, r;
+    size_t freq;
+};
 
-    bool operator==(const Pair &other) const {
+struct Pair_Key {
+    Token l, r;
+
+    bool operator==(const Pair_Key &other) const {
         return l.value == other.l.value &&
                r.value == other.r.value;
     }
 };
 
 template <>
-struct std::hash<Pair>
+struct std::hash<Pair_Key>
 {
-    std::size_t operator()(const Pair& k) const
+    std::size_t operator()(const Pair_Key& k) const
     {
         union {
             uint32_t lr[2];
@@ -42,7 +47,7 @@ struct std::hash<Pair>
     }
 };
 
-typedef std::unordered_map<Pair, size_t> Freq;
+typedef std::unordered_map<Pair_Key, size_t> Freq;
 
 bool parse_tokens_from_file(const char *path, std::vector<Token> &result)
 {
@@ -79,7 +84,7 @@ Freq collect_freqs(std::vector<Token> &tokens_in)
 {
     Freq result;
     for (size_t i = 0; i < tokens_in.size() - 1; i++) {
-        Pair pair = {tokens_in[i], tokens_in[i + 1]};
+        Pair_Key pair = {tokens_in[i], tokens_in[i + 1]};
         if (result.count(pair)) result[pair] += 1;
         else result.insert({pair, 1});
     }
@@ -115,16 +120,16 @@ void print_freq(Freq &freq)
     }
 }
 
-void pair_dec_freq_or_remove(Pair k, Freq &freq)
-{
-    auto pair_freq = freq.find(k);
-    assert(pair_freq != freq.end());
-    assert(pair_freq->second > 0);
-    pair_freq->second -= 1;
-    if (pair_freq->second == 0) {
-        freq.erase(k);
-    }
-}
+// void pair_dec_freq_or_remove(Pair k, Freq &freq)
+// {
+//     auto pair_freq = freq.find(k);
+//     assert(pair_freq != freq.end());
+//     assert(pair_freq->second > 0);
+//     pair_freq->second -= 1;
+//     if (pair_freq->second == 0) {
+//         freq.erase(k);
+//     }
+// }
 
 bool write_entire_file(const char *path, const void *data, size_t size)
 {
@@ -153,7 +158,7 @@ bool find_most_frequent_pair(std::vector<Token> *tokens, Pair &res)
 {
     Freq freq = Freq(tokens->size() - 1);
     for (size_t i = 0; i < tokens->size() - 1; i++) {
-        Pair k = {tokens->at(i), tokens->at(i+1)};
+        Pair_Key k = {tokens->at(i), tokens->at(i+1)};
         Freq::iterator entry = freq.find(k);
         if (entry == freq.end()) freq.insert({k, 1});
         else entry->second += 1;
@@ -163,11 +168,22 @@ bool find_most_frequent_pair(std::vector<Token> *tokens, Pair &res)
     for (const auto &it : freq) {
         if (it.second > max_freq) {
             max_freq = it.second;
-            res = {it.first.l, it.first.r};
+            res = {it.first.l, it.first.r, max_freq};
         }
     }
 
     return max_freq > 1;
+}
+
+void render_token(std::vector<Pair> &pairs, Token token)
+{
+    if (!token.is_node) {
+        printf("%lc", token.value);
+    } else {
+        assert(token.value < pairs.size());
+        render_token(pairs, pairs[token.value].l);
+        render_token(pairs, pairs[token.value].r);
+    }
 }
 
 int main(int argc, char **argv)
@@ -196,8 +212,10 @@ int main(int argc, char **argv)
         pairs.push_back(most_freq_pair);
 
         tokens_out->clear();
-        for (size_t i = 0; i < tokens_in->size() - 1;) {
-            Pair p = {tokens_in->at(i), tokens_in->at(i+1)};
+
+        size_t i;
+        for (i = 0; i < tokens_in->size() - 1;) {
+            Pair_Key p = {tokens_in->at(i), tokens_in->at(i+1)};
             if (memcmp(&p, &most_freq_pair, sizeof(p)) == 0) {
                 tokens_out->push_back({new_token_id, true});
                 i += 2;
@@ -206,11 +224,28 @@ int main(int argc, char **argv)
                 i += 1;
             }
         }
+        if (i <= tokens_in->size()) {
+            tokens_out->push_back(tokens_in->at(i));
+        }
 
         auto *tmp = tokens_in;
         tokens_in = tokens_out;
         tokens_out = tmp;
     }
+
+    // for (size_t i = 0; i < pairs.size(); i++) {
+    //     printf("%zu: ", i);
+    //     print_token(pairs[i].l);
+    //     print_token(pairs[i].r);
+    //     printf(" = %zu\n", pairs[i].freq);
+    // }
+    //
+    // print_tokens(tokens_in);
+    //
+    // for (size_t i = 0; i < pairs.size(); i++) {
+    //     render_token(pairs, {i, true});
+    //     printf("\n");
+    // }
 
     if (!write_entire_file(OUTPUT_FILE, pairs.data(), pairs.size()*sizeof(Pair)))
         return 1;
