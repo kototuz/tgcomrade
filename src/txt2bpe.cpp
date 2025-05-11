@@ -25,8 +25,8 @@ struct Pair_Key {
     Token l, r;
 
     bool operator==(const Pair_Key &other) const {
-        return l.value == other.l.value &&
-               r.value == other.r.value;
+        return memcmp(&l, &other.l, sizeof(l)) == 0 &&
+               memcmp(&r, &other.r, sizeof(r)) == 0;
     }
 };
 
@@ -40,8 +40,8 @@ struct std::hash<Pair_Key>
             std::size_t hash;
         } u;
 
-        u.lr[0] = k.l.value;
-        u.lr[0] = k.r.value;
+        u.lr[0] = k.l.value << k.l.is_node;
+        u.lr[0] = k.r.value << k.r.is_node;
 
         return u.hash;
     }
@@ -80,13 +80,14 @@ bool parse_tokens_from_file(const char *path, std::vector<Token> &result)
     return true;
 }
 
-Freq collect_freqs(std::vector<Token> &tokens_in)
+Freq collect_freq(std::vector<Token> &tokens_in)
 {
     Freq result;
     for (size_t i = 0; i < tokens_in.size() - 1; i++) {
-        Pair_Key pair = {tokens_in[i], tokens_in[i + 1]};
-        if (result.count(pair)) result[pair] += 1;
-        else result.insert({pair, 1});
+        Pair_Key k = {tokens_in[i], tokens_in[i + 1]};
+        Freq::iterator e = result.find(k);
+        if (e == result.end()) result.insert({k, 1});
+        else e->second += 1;
     }
 
     return result;
@@ -154,21 +155,14 @@ bool write_entire_file(const char *path, const void *data, size_t size)
     return true;
 }
 
-bool find_most_frequent_pair(std::vector<Token> *tokens, Pair &res)
+bool find_most_frequent_pair(Freq &freq, Pair_Key &res, size_t &pair_freq)
 {
-    Freq freq = Freq(tokens->size() - 1);
-    for (size_t i = 0; i < tokens->size() - 1; i++) {
-        Pair_Key k = {tokens->at(i), tokens->at(i+1)};
-        Freq::iterator entry = freq.find(k);
-        if (entry == freq.end()) freq.insert({k, 1});
-        else entry->second += 1;
-    }
-
     size_t max_freq = 0;
     for (const auto &it : freq) {
         if (it.second > max_freq) {
             max_freq = it.second;
-            res = {it.first.l, it.first.r, max_freq};
+            res = {it.first.l, it.first.r};
+            pair_freq = max_freq;
         }
     }
 
@@ -202,37 +196,136 @@ int main(int argc, char **argv)
     std::vector<Token> tokens_out_buf;
     std::vector<Token> *tokens_out = &tokens_out_buf;
 
-    Pair most_freq_pair;
+    Freq freq = collect_freq(tokens_in_buf);
+
+    size_t pair_freq;
+    Pair_Key most_freq_pair;
     std::vector<Pair> pairs;
-    while (find_most_frequent_pair(tokens_in, most_freq_pair)) {
+    while (find_most_frequent_pair(freq, most_freq_pair, pair_freq)) {
+        // print_tokens(tokens_in);
+        // if (freq.count(Pair_Key{{L' ', false}, {L'a', false}})) {
+        //     puts("++++++++++++++++++++");
+        //     printf("PAIR: %zu\n", freq[{{L' ', false}, {L'a', false}}]);
+        // }
+        // puts("===================");
         printf("INFO: tokens=%zu, pairs=%zu\n",
                tokens_in->size(), pairs.size());
 
-        uint32_t new_token_id = pairs.size();
-        pairs.push_back(most_freq_pair);
+        Token new_token = {(uint32_t)pairs.size(), true};
+        pairs.push_back({most_freq_pair.l, most_freq_pair.r, pair_freq});
 
         tokens_out->clear();
 
-        size_t i;
-        for (i = 0; i < tokens_in->size() - 1;) {
-            Pair_Key p = {tokens_in->at(i), tokens_in->at(i+1)};
-            if (memcmp(&p, &most_freq_pair, sizeof(p)) == 0) {
-                tokens_out->push_back({new_token_id, true});
+        assert(tokens_in->size() > 2);
+
+        size_t i = 0;
+        Freq::iterator entry;
+        Pair_Key pair_key = {tokens_in->at(0), tokens_in->at(1)};
+        if (memcmp(&pair_key, &most_freq_pair, sizeof(pair_key)) == 0) {
+            pair_key = {tokens_in->at(1), tokens_in->at(2)};
+            entry = freq.find(pair_key);
+            assert(entry != freq.end());
+            assert(entry->second > 0);
+            entry->second -= 1;
+
+            pair_key = {new_token, tokens_in->at(2)};
+            entry = freq.find(pair_key);
+            if (entry == freq.end()) freq.insert({pair_key, 1});
+            else entry->second += 1;
+
+            tokens_out->push_back(new_token);
+            freq[most_freq_pair] -= 1;
+            i += 2;
+        } else {
+            tokens_out->push_back(tokens_in->at(0));
+            i += 1;
+        }
+
+        for (; i < tokens_in->size() - 2;) {
+            pair_key = {tokens_in->at(i), tokens_in->at(i+1)};
+            if (memcmp(&pair_key, &most_freq_pair, sizeof(pair_key)) == 0) {
+                pair_key = {tokens_in->at(i+1), tokens_in->at(i+2)};
+                entry = freq.find(pair_key);
+                assert(entry != freq.end());
+                assert(entry->second > 0);
+                entry->second -= 1;
+                pair_key = {new_token, tokens_in->at(i+2)};
+                entry = freq.find(pair_key);
+                if (entry == freq.end()) freq.insert({pair_key, 1});
+                else entry->second += 1;
+
+                pair_key = {tokens_out->back(), tokens_in->at(i)};
+                entry = freq.find(pair_key);
+                assert(entry != freq.end());
+                assert(entry->second > 0);
+                entry->second -= 1;
+                pair_key = {tokens_out->back(), new_token};
+                entry = freq.find(pair_key);
+                if (entry == freq.end()) freq.insert({pair_key, 1});
+                else entry->second += 1;
+
+                tokens_out->push_back(new_token);
+                freq[most_freq_pair] -= 1;
                 i += 2;
             } else {
                 tokens_out->push_back(tokens_in->at(i));
                 i += 1;
             }
         }
-        if (i <= tokens_in->size()) {
+
+        assert(i >= tokens_in->size()-2);
+        if (i == tokens_in->size()-2) {
+            pair_key = {tokens_in->at(i), tokens_in->at(i+1)};
+            if (memcmp(&pair_key, &most_freq_pair, sizeof(pair_key)) == 0) {
+                pair_key = {tokens_out->back(), tokens_in->at(i)};
+                entry = freq.find(pair_key);
+                assert(entry != freq.end());
+                assert(entry->second > 0);
+                entry->second -= 1;
+
+                pair_key = {tokens_out->back(), new_token};
+                entry = freq.find(pair_key);
+                if (entry == freq.end()) freq.insert({pair_key, 1});
+                else entry->second += 1;
+
+                tokens_out->push_back(new_token);
+                freq[most_freq_pair] -= 1;
+            } else {
+                tokens_out->push_back(tokens_in->at(i));
+                tokens_out->push_back(tokens_in->at(i+1));
+            }
+        } else {
             tokens_out->push_back(tokens_in->at(i));
         }
+
+        assert(freq[most_freq_pair] == 0);
+        freq.erase(most_freq_pair);
+
+        // size_t i;
+        // for (i = 0; i < tokens_in->size() - 1;) {
+        //     Pair_Key p = {tokens_in->at(i), tokens_in->at(i+1)};
+        //     if (memcmp(&p, &most_freq_pair, sizeof(p)) == 0) {
+        //         tokens_out->push_back({new_token_id, true});
+        //         i += 2;
+        //     } else {
+        //         tokens_out->push_back(tokens_in->at(i));
+        //         i += 1;
+        //     }
+        // }
+        // if (i <= tokens_in->size()) {
+        //     tokens_out->push_back(tokens_in->at(i));
+        // }
 
         auto *tmp = tokens_in;
         tokens_in = tokens_out;
         tokens_out = tmp;
     }
 
+    printf("INFO: Generated %zu pairs\n", pairs.size());
+
+    // print_freq(freq);
+    // puts("===================");
+    //
     // for (size_t i = 0; i < pairs.size(); i++) {
     //     printf("%zu: ", i);
     //     print_token(pairs[i].l);
