@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <assert.h>
+#include <fstream>
 #include <iostream>
 #include <string.h>
 #include <ctype.h>
+#include <clocale>
 #include <vector>
 
 #include <llama.h>
@@ -23,6 +25,8 @@ namespace td_api = td::td_api;
     X(authorizationStateWaitCode, auth_state_wait_code) \
     X(updateNewMessage, update_new_message) \
 
+static bool str_to_int64(const char *str, size_t len, std::int64_t *res);
+
 struct Generator {
     llama_model *model;
     const llama_vocab *vocab;
@@ -35,6 +39,124 @@ struct Generator {
     virtual bool load(const char *file_path) = 0;
     virtual bool parse_args(int argc, char **argv) = 0;
     virtual bool gen_response(const std::string &in, std::string &res) = 0;
+};
+
+struct BpeGenerator : Generator {
+    struct Token {
+        uint32_t value; // may be either `symbol` or `pair_id`
+        bool is_node;
+    };
+
+    struct Pair {
+        Token l, r;
+        size_t freq;
+    };
+
+    std::vector<Pair> pairs;
+    std::vector<Token> next;
+    std::int64_t gen_limit = 10;
+
+    virtual bool load(const char *path) override
+    {
+        puts("Loading bpe pairs...");
+
+        setlocale(LC_ALL, "");
+        srand(time(0));
+
+        std::ifstream ifs(path);
+        std::string bytes((std::istreambuf_iterator<char>(ifs)),
+                          (std::istreambuf_iterator<char>()));
+
+        if (!ifs.good()) {
+            fprintf(stderr, "ERROR: Could not open file '%s'\n", path);
+            return false;
+        }
+
+        if (bytes.size()%sizeof(Pair) != 0) {
+            fprintf(stderr, "%s: file size in bytes (%zu) must be divisible by %zu\n", path, bytes.size(), sizeof(Pair));
+            return false;
+        }
+
+        Pair *items = (Pair *)bytes.c_str();
+        size_t count = bytes.size()/sizeof(Pair);
+        for (size_t i = 0; i < count; i++) {
+            pairs.push_back(items[i]);
+        }
+
+        return true;
+    }
+
+    virtual bool parse_args(int argc, char **argv) override
+    {
+        if (argc == 0) return true;
+        if (argc != 1) {
+            fprintf(stderr, "BPE ARGS: [generation-limit]\n");
+            return false;
+        }
+
+        if (!str_to_int64(argv[0], strlen(argv[0]), &gen_limit)) return false;
+
+        printf("Generation limit: %zu\n", gen_limit);
+
+        return true;
+    }
+
+    void render_token(std::vector<Pair> &pairs, Token token, std::wstring &dest)
+    {
+        if (!token.is_node) {
+            dest.push_back(token.value);
+        } else {
+            assert(token.value < pairs.size());
+            render_token(pairs, pairs[token.value].l, dest);
+            render_token(pairs, pairs[token.value].r, dest);
+        }
+    }
+
+    virtual bool gen_response(const std::string &, std::string &res) override
+    {
+        std::wstring wstring;
+        Token token = {(uint32_t)rand()%(uint32_t)pairs.size(), true};
+        for (std::int64_t i = 0; i < gen_limit; i++) {
+            render_token(pairs, token, wstring);
+
+            next.clear();
+            while (true) {
+                for (size_t i = 0; i < pairs.size(); i++) {
+                    if (memcmp(&pairs[i].l, &token, sizeof(token)) == 0) {
+                        next.push_back(pairs[i].r);
+                    }
+                }
+                if (next.size() > 0) break;
+                if (!token.is_node) break;
+                token = pairs[token.value].r;
+            }
+
+            if (next.size() == 0) break;
+
+            token = next[rand()%next.size()];
+        }
+
+        size_t res_len = wcstombs(nullptr, wstring.c_str(), 0);
+        if (res_len == (size_t)-1) {
+            fprintf(stderr, "ERROR: Could not convert some wide character\n");
+            return false;
+        }
+        res_len += 1;
+
+        char *buffer = (char *) malloc(res_len);
+        assert(buffer != nullptr);
+        size_t len = wcstombs(buffer, wstring.c_str(), res_len);
+        if (len == (size_t)-1) {
+            fprintf(stderr, "ERROR: Could not convert some wide character\n");
+            free(buffer);
+            return false;
+        }
+
+        res = std::string(buffer);
+        free(buffer);
+
+        return true;
+    }
 };
 
 // NOTE: I'm not an OOP guy. These are structures
@@ -176,7 +298,6 @@ static void update_auth_state(td_api::object_ptr<td_api::updateAuthorizationStat
 static void update_new_message(td_api::object_ptr<td_api::updateNewMessage>);
 
 static void process_update(td_api::object_ptr<td_api::Object> u);
-static bool str_to_int64(const char *str, size_t len, std::int64_t *res);
 static bool load_generator(const char *file_path, Generator **res);
 
 static td::ClientManager manager;
@@ -243,6 +364,8 @@ static bool load_generator(const char *file_path, Generator **res)
 
     if (strcmp(extension, ".gguf") == 0) {
         *res = new LlamaGenerator{};
+    } else if (strcmp(extension, ".bpe") == 0) {
+        *res = new BpeGenerator{};
     } else {
         fprintf(stderr, "ERROR: Unknown generator type `%s`\n", extension);
         return false;
@@ -265,6 +388,7 @@ static void process_update(td_api::object_ptr<td_api::Object> u)
 
 static bool str_to_int64(const char *str, size_t len, std::int64_t *res)
 {
+    *res = 0;
     for (size_t i = 0; i < len; i++) {
         if (!isdigit(str[i])) return false;
         *res = *res*10 + (str[i]-'0');
