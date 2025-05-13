@@ -23,6 +23,151 @@ namespace td_api = td::td_api;
     X(authorizationStateWaitCode, auth_state_wait_code) \
     X(updateNewMessage, update_new_message) \
 
+struct Generator {
+    llama_model *model;
+    const llama_vocab *vocab;
+    llama_context *ctx;
+    llama_sampler *smpl;
+    std::vector<llama_chat_message> messages;
+    std::vector<char> formatted;
+    int prev_formatted_len = 0;
+
+    virtual bool load(const char *file_path) = 0;
+    virtual bool parse_args(int argc, char **argv) = 0;
+    virtual bool gen_response(const std::string &in, std::string &res) = 0;
+};
+
+// NOTE: I'm not an OOP guy. These are structures
+struct LlamaGenerator : Generator {
+    virtual bool load(const char *model_path) override
+    {
+        puts("Loading model...");
+
+        llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
+
+        ggml_backend_load_all();
+
+        llama_model_params model_params = llama_model_default_params();
+        model_params.n_gpu_layers = LLAMA_GPU_LAYER_COUNT;
+
+        model = llama_model_load_from_file(model_path, model_params);
+        if (!model) {
+            fputs("ERROR: Could not load model from file\n", stderr);
+            return false;
+        }
+
+        vocab = llama_model_get_vocab(model);
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = LLAMA_CONTEXT_SIZE;
+        ctx_params.n_batch = LLAMA_CONTEXT_SIZE;
+
+        ctx = llama_init_from_model(model, ctx_params);
+        if (!ctx) {
+            fputs("ERROR: Could not create context\n", stderr);
+            return false;
+        }
+
+        smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.8f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+        formatted = std::vector<char>(llama_n_ctx(ctx));
+
+        return true;
+    }
+
+    virtual bool parse_args(int argc, char **argv) override
+    {
+        if (argc == 0) return true;
+        if (argc != 1) {
+            fprintf(stderr, "ERROR: Unexpected arguments to llama\n");
+            return false;
+        }
+
+        printf("Pushing system message \"%s\" to model...\n", argv[0]);
+
+        messages.push_back({"system", strdup(argv[0])});
+        return true;
+    }
+
+    virtual bool gen_response(const std::string &input, std::string &res) override
+    {
+        const char *tmpl = llama_model_chat_template(model, nullptr);
+
+        messages.push_back({"user", strdup(input.c_str())});
+        int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+        if (new_len > (int)formatted.size()) {
+            formatted.resize(new_len);
+            new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
+        }
+        if (new_len < 0) {
+            fputs("ERROR: Could not apply chat template\n", stderr);
+            return false;
+        }
+
+        std::string prompt(formatted.begin() + prev_formatted_len, formatted.begin() + new_len);
+
+        const bool is_first = llama_kv_self_used_cells(ctx) == 0;
+
+        const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, is_first, true);
+        std::vector<llama_token> prompt_tokens(n_prompt_tokens);
+        if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), is_first, true) < 0) {
+            fputs("ERROR: Could not tokenize the prompt\n", stderr);
+            return false;
+        }
+
+        llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
+        llama_token new_token_id;
+        printf(">> ");
+        while (true) {
+            int n_ctx = llama_n_ctx(ctx);
+            int n_ctx_used = llama_kv_self_used_cells(ctx);
+            if (n_ctx_used + batch.n_tokens > n_ctx) {
+                fputs("ERROR: Context size exceeded\n", stderr);
+                return false;
+            }
+
+            if (llama_decode(ctx, batch)) {
+                fputs("ERROR: Could not decode\n", stderr);
+                return false;
+            }
+
+            new_token_id = llama_sampler_sample(smpl, ctx, -1);
+
+            if (llama_vocab_is_eog(vocab, new_token_id)) {
+                break;
+            }
+
+            char buf[256];
+            int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+            if (n < 0) {
+                fputs("ERROR: Could not convert token to piece\n", stderr);
+                return false;
+            }
+
+            printf("%.*s", n, buf);
+            fflush(stdout);
+
+            res.append(buf, n);
+
+            batch = llama_batch_get_one(&new_token_id, 1);
+        }
+
+        putchar('\n');
+
+        messages.push_back({"assistant", strdup(res.c_str())});
+        prev_formatted_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), false, nullptr, 0);
+        if (prev_formatted_len < 0) {
+            fputs("ERROR: Could not apply chat template\n", stderr);
+            return false;
+        }
+
+        return true;
+    }
+};
+
 static void auth_state_wait_code(td_api::object_ptr<td_api::authorizationStateWaitCode>);
 static void auth_state_wait_phone_number(td_api::object_ptr<td_api::authorizationStateWaitPhoneNumber>);
 static void auth_state_ready(td_api::object_ptr<td_api::authorizationStateReady>);
@@ -32,34 +177,27 @@ static void update_new_message(td_api::object_ptr<td_api::updateNewMessage>);
 
 static void process_update(td_api::object_ptr<td_api::Object> u);
 static bool str_to_int64(const char *str, size_t len, std::int64_t *res);
-static bool load_model(const char *model);
-static bool generate_response(const std::string &prompt, std::string &res);
-static bool parse_args(int argc, char **argv, std::int64_t *chat_id, char **model_path, char **sys_prompt);
+static bool load_generator(const char *file_path, Generator **res);
 
 static td::ClientManager manager;
 static std::int32_t      client_id;
 static std::int64_t      chat_id;
 static std::int64_t      user_id;
 
-static llama_model *model;
-static const llama_vocab *vocab;
-static llama_context *ctx;
-static llama_sampler *smpl;
-static std::vector<llama_chat_message> messages;
-static std::vector<char> formatted;
-static int prev_formatted_len = 0;
+// NOTE: One-off leak
+static Generator *generator;
 
 int main(int argc, char **argv)
 {
-    char *model_path;
-    char *sys_prompt;
-    if (!parse_args(argc, argv, &chat_id, &model_path, &sys_prompt)) return 1;
-
-    if (!load_model(model_path)) return 1;
-
-    if (sys_prompt != nullptr) {
-        messages.push_back({"system", strdup(sys_prompt)});
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <chat-id> <generator> [GENERATOR ARGS]\n", argv[0]);
+        return 1;
     }
+
+    if (!str_to_int64(argv[1], strlen(argv[1]), &chat_id)) return 1;
+
+    if (!load_generator(argv[2], &generator)) return 1;
+    if (!generator->parse_args(argc-3, argv+3)) return 1;
 
     // Initialize client
     td::ClientManager::execute(td_api::make_object<td_api::setLogVerbosityLevel>(1));
@@ -90,168 +228,27 @@ int main(int argc, char **argv)
     return 0;
 }
 
-
-static bool generate_response(const std::string &input, std::string &res)
+static bool load_generator(const char *file_path, Generator **res)
 {
-    const char *tmpl = llama_model_chat_template(model, nullptr);
-
-    messages.push_back({"user", strdup(input.c_str())});
-    int new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
-    if (new_len > (int)formatted.size()) {
-        formatted.resize(new_len);
-        new_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), true, formatted.data(), formatted.size());
-    }
-    if (new_len < 0) {
-        fputs("ERROR: Could not apply chat template\n", stderr);
-        return false;
-    }
-
-    std::string prompt(formatted.begin() + prev_formatted_len, formatted.begin() + new_len);
-    
-    const bool is_first = llama_kv_self_used_cells(ctx) == 0;
-
-    const int n_prompt_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.size(), NULL, 0, is_first, true);
-    std::vector<llama_token> prompt_tokens(n_prompt_tokens);
-    if (llama_tokenize(vocab, prompt.c_str(), prompt.size(), prompt_tokens.data(), prompt_tokens.size(), is_first, true) < 0) {
-        fputs("ERROR: Could not tokenize the prompt\n", stderr);
-        return false;
-    }
-
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
-    llama_token new_token_id;
-    printf(">> ");
-    while (true) {
-        int n_ctx = llama_n_ctx(ctx);
-        int n_ctx_used = llama_kv_self_used_cells(ctx);
-        if (n_ctx_used + batch.n_tokens > n_ctx) {
-            fputs("ERROR: Context size exceeded\n", stderr);
+    // Get extension
+    size_t len = strlen(file_path);
+    const char *extension = &file_path[len-1];
+    while (*extension != '.') {
+        if (extension == file_path) {
+            fprintf(stderr, "ERROR: Could not identify the generator: filename doesn't have an extension\n");
             return false;
         }
-
-        if (llama_decode(ctx, batch)) {
-            fputs("ERROR: Could not decode\n", stderr);
-            return false;
-        }
-
-        new_token_id = llama_sampler_sample(smpl, ctx, -1);
-
-        if (llama_vocab_is_eog(vocab, new_token_id)) {
-            break;
-        }
-
-        char buf[256];
-        int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
-        if (n < 0) {
-            fputs("ERROR: Could not convert token to piece\n", stderr);
-            return false;
-        }
-
-        printf("%.*s", n, buf);
-        fflush(stdout);
-
-        res.append(buf, n);
-
-        batch = llama_batch_get_one(&new_token_id, 1);
+        extension -= 1;
     }
 
-    putchar('\n');
-
-    messages.push_back({"assistant", strdup(res.c_str())});
-    prev_formatted_len = llama_chat_apply_template(tmpl, messages.data(), messages.size(), false, nullptr, 0);
-    if (prev_formatted_len < 0) {
-        fputs("ERROR: Could not apply chat template\n", stderr);
+    if (strcmp(extension, ".gguf") == 0) {
+        *res = new LlamaGenerator{};
+    } else {
+        fprintf(stderr, "ERROR: Unknown generator type `%s`\n", extension);
         return false;
     }
 
-    return true;
-}
-
-static bool load_model(const char *model_path)
-{
-    puts("Loading model...");
-
-    llama_log_set([](enum ggml_log_level, const char *, void *) {}, nullptr);
-
-    ggml_backend_load_all();
-
-    llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = LLAMA_GPU_LAYER_COUNT;
-
-    model = llama_model_load_from_file(model_path, model_params);
-    if (!model) {
-        fputs("ERROR: Could not load model from file\n", stderr);
-        return false;
-    }
-
-    vocab = llama_model_get_vocab(model);
-
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = LLAMA_CONTEXT_SIZE;
-    ctx_params.n_batch = LLAMA_CONTEXT_SIZE;
-
-    ctx = llama_init_from_model(model, ctx_params);
-    if (!ctx) {
-        fputs("ERROR: Could not create context\n", stderr);
-        return false;
-    }
-
-    smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
-    llama_sampler_chain_add(smpl, llama_sampler_init_min_p(0.05f, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.8f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
-
-    formatted = std::vector<char>(llama_n_ctx(ctx));
-
-    return true;
-}
-
-static bool parse_args(int argc, char **argv,
-                       std::int64_t *chat_id,
-                       char **model_path,
-                       char **sys_prompt)
-{
-#define CHAT_ID_FLAG 0b01
-#define MODEL_FLAG   0b10
-
-    *sys_prompt = nullptr;
-
-    char state = 0;
-    for (int i = 1; i < argc; i += 2) {
-        if (strcmp(argv[i], "-c") == 0) {
-            if (i+1 >= argc) {
-                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
-                return false;
-            }
-            if (!str_to_int64(argv[i+1], strlen(argv[i+1]), chat_id)) {
-                fputs("ERROR: Invalid chat id integer\n", stderr);
-                return false;
-            }
-            state |= CHAT_ID_FLAG;
-        } else if (strcmp(argv[i], "-m") == 0) {
-            if (i+1 >= argc) {
-                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
-                return false;
-            }
-            *model_path = argv[i+1];
-            state |= MODEL_FLAG;
-        } else if (strcmp(argv[i], "-sys") == 0) {
-            if (i+1 >= argc) {
-                fprintf(stderr, "ERROR: Provide value after '%s'\n", argv[i]);
-                return false;
-            }
-            *sys_prompt = argv[i+1];
-        } else {
-            fprintf(stderr, "ERROR: Unknown flag '%s'\n", argv[i]);
-            return false;
-        }
-    }
-
-    if (state != (CHAT_ID_FLAG|MODEL_FLAG)) {
-        fprintf(stderr, "Usage: %s -c <chat-id> -m <model.gguf> [-sys <sys-prompt>]\n", argv[0]);
-        return false;
-    }
-
-    return true;
+    return (*res)->load(file_path);
 }
 
 static void process_update(td_api::object_ptr<td_api::Object> u)
@@ -298,7 +295,7 @@ static void update_new_message(td_api::object_ptr<td_api::updateNewMessage> u)
 
         std::string resp;
         message_content->text_ = td_api::make_object<td_api::formattedText>();
-        if (generate_response(static_cast<td_api::messageText &>(*u->message_->content_).text_->text_, resp)) {
+        if (generator->gen_response(static_cast<td_api::messageText &>(*u->message_->content_).text_->text_, resp)) {
             message_content->text_->text_ = std::move(resp);
         } else {
             message_content->text_->text_ = "Sorry, something went wrong";
