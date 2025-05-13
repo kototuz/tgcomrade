@@ -204,7 +204,7 @@ struct LlamaGenerator : Generator {
     {
         if (argc == 0) return true;
         if (argc != 1) {
-            fprintf(stderr, "ERROR: Unexpected arguments to llama\n");
+            fprintf(stderr, "LLAMA ARGS: [system-message]\n");
             return false;
         }
 
