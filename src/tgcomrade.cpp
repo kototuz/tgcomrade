@@ -481,3 +481,5 @@ static void auth_state_ready(td_api::object_ptr<td_api::authorizationStateReady>
     puts("Succesful login");
     manager.send(client_id, 1, td_api::make_object<td_api::getMe>());
 }
+
+// TODO: Better reporting
